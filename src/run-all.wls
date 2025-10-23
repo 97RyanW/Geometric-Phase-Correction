@@ -1,15 +1,15 @@
 (* ============================================
- run-all.wls — headless runner & auto-exporter (v4.2)
+ run-all.wls — headless runner & auto-exporter (v4.5)
  - Roots (first match wins):
      1) src/notebooks_run-all WLS
      2) <repo>/notebooks
  - Exports to: src/results/{logs,figs,tables,css}
  - Captures Graphics returned, printed, or assigned to variables
- - Skips berry_phase.nb by default
+ - Skips berry_phase.nb and *_Exports.nb by default (avoid duplicates)
  - Fallbacks:
      * wavefunctionplot.nb -> PDF/PNG/CSV
      * any probability_plot*.nb -> PNG/PDF/CSV of {|α|^2,|β|^2}
- - NEW: detect & SKIP “empty plots”; if a prob-plot yields only empties, fallback kicks in
+     * If nothing exported: scrape GraphicsBox / Graphics3DBox and export
  ============================================ *)
 
 Begin["RunnerPrivate`"];
@@ -78,12 +78,13 @@ orderKey[nm_] := {If[StringMatchQ[nm, "wavefunctionplot.nb"], -1, 0],
                   If[StringContainsQ[nm, "Exports", IgnoreCase->True], 1, 0], nm};
 nbNames = SortBy[Keys[nbMap], orderKey];
 
-(* Skip stray berry_phase.nb unless explicitly asked on CLI *)
+(* Skip stray berry_phase.nb and *_Exports.nb by default *)
 nbNames = DeleteCases[nbNames, "berry_phase.nb"];
+nbNames = DeleteCases[nbNames, _?(StringMatchQ[#, ___ ~~ "_Exports.nb"]&)];
 
-(* Allow CLI subset selection *)
+(* Allow CLI subset selection (overrides the skipping) *)
 If[ListQ[$ScriptCommandLine] && Length[$ScriptCommandLine] >= 2,
-  With[{wanted = Rest @ $ScriptCommandLine}, nbNames = Select[nbNames, MemberQ[wanted, #]&]]
+  With[{wanted = Rest @ $ScriptCommandLine}, nbNames = Select[Keys@nbMap, MemberQ[wanted, #] &]]
 ];
 
 If[nbNames === {}, logLine["NO NOTEBOOKS FOUND in roots: ", StringRiffle[nbRoots, " | "]];
@@ -151,7 +152,7 @@ makeExpr[box_] := Module[{try}, try[f_] := Quiet@Check[MakeExpression[box, f], $
 
 snapshot[dir_] := If[DirectoryQ[dir], FileNameDrop[#, FileNameDepth[dir]-1]& /@ FileNames["*", dir, Infinity], {}];
 
-(* ---------- Graphics, “emptiness” test & CSS ---------- *)
+(* ---------- Graphics, emptiness test & CSS ---------- *)
 graphicsQ[expr_] := MatchQ[expr, _Graphics | _Graphics3D | _GeoGraphics | _Graph];
 
 hasContentQ[g_] := Module[{cnt},
@@ -186,18 +187,45 @@ emitCSS[nbBase_, graphics_List] := Module[{out = FileNameJoin[{cssDir, nbBase<>"
   Quiet @ Check[Export[out, StringRiffle[lines, "\n"], "Text"], Null]; out
 ];
 
-exportGraphicsList[nbBase_, cellIndex_Integer, glist_, gHashes_Association, exportedGraphics_List] := Module[
+(* -------- GLOBAL de-dup across the whole run -------- *)
+$GHashesGlobal = <||>;  (* keys: hash -> path of first export *)
+
+exportGraphicsList[nbBase_, cellIndex_Integer, glist_, gHashesNotebook_Association] := Module[
   {lst = Select[Flatten @ {glist}, graphicsQ], paths = {}, k = 0, path, imgSize = 1200, dpi = 192, h},
   Do[
     If[!hasContentQ[g], logLine["EMPTY-PLOT-SKIP:", nbBase, " cell=", cellIndex]; Continue[]];
-    h = hashG[g]; If[KeyExistsQ[gHashes, h], Continue[]];
-    k++; path = FileNameJoin[{figDir, nbBase <> "_c" <> IntegerString[cellIndex,10,3] <> "_g" <> IntegerString[k,10,2] <> ".png"}];
+    h = hashG[g];
+    If[KeyExistsQ[gHashesNotebook, h] || KeyExistsQ[$GHashesGlobal, h],
+      logLine["DEDUPE: skip identical graphic (hash=", h, ") in ", nbBase, " cell=", cellIndex]; Continue[]];
+    k++;
+    path = FileNameJoin[{figDir, nbBase <> "_c" <> IntegerString[cellIndex,10,3] <> "_g" <> IntegerString[k,10,2] <> ".png"}];
     Quiet @ Check[Export[path, g, "PNG", ImageResolution -> dpi, ImageSize -> imgSize], Null];
-    gHashes[h] = path; AppendTo[paths, path]; AppendTo[exportedGraphics, g];
+    gHashesNotebook[h] = path; $GHashesGlobal[h] = path; AppendTo[paths, path];
     ,
     {g, lst}
   ];
   paths
+];
+
+(* --------- BOX → GRAPHICS exporter ---------- *)
+boxesToGraphics[b_] := Module[{exprH, expr},
+  exprH = Quiet @ Check[ToExpression[BoxData @ b, StandardForm, HoldComplete], $Failed];
+  If[exprH === $Failed, Return[{}]];
+  expr  = Quiet @ Check[ReleaseHold[exprH], $Failed];
+  If[expr === $Failed, Return[{}]];
+  collectGraphics[expr]
+];
+
+exportFromBoxes[nb_Notebook, nbBase_, gHashesNotebook_Association] := Module[
+  {boxes, total = 0, allPaths = {}, paths},
+  boxes = Cases[nb, Cell[BoxData[b_], ___] :> b, Infinity];
+  Do[
+    paths = exportGraphicsList[nbBase, i, boxesToGraphics[boxes[[i]]], gHashesNotebook];
+    If[ListQ[paths] && paths =!= {}, total += Length[paths]; allPaths = Join[allPaths, paths]],
+    {i, Length[boxes]}
+  ];
+  If[total > 0, logLine["BOX-SCRAPE: exported ", total, " figures from GraphicsBox in ", nbBase]];
+  allPaths
 ];
 
 (* ---------- Fallback solvers ---------- *)
@@ -217,7 +245,7 @@ wavefunctionFallback[] := Module[
   {outPdf=FileNameJoin[{figDir, "wavefunction_ReImPlot.pdf"}],
    outPng=FileNameJoin[{figDir, "wavefunction_ReImPlot.png"}],
    outCsv=FileNameJoin[{tabDir, "wavefunction_ReIm_timeseries.csv"}],
-   okCSV=False, p=$Failed, ts, aFun=$Failed, bFun=$Failed,
+   ok=False, p=$Failed, ts, aFun=$Failed, bFun=$Failed,
    plt=globalVal["plt"], sol=globalVal["sol"], alphaS=globalSym["alpha"], betaS=globalSym["beta"],
    Hdef=hasDownQ["H"], hVal},
   If[FileExistsQ[outPdf]||FileExistsQ[outPng]||FileExistsQ[outCsv], Return[True]];
@@ -228,9 +256,9 @@ wavefunctionFallback[] := Module[
              PlotStyle->{Directive[.90,.20,.20,Thick],Directive[.90,.20,.20,Dashed],Directive[.12,.47,.71,Thick],Directive[.12,.47,.71,Dashed]},
              ImageSize->600, PlotTheme->None, PlotLegends->None];
     ts = Table[{tt, Re[alphaS[tt]/.sol], Im[alphaS[tt]/.sol], Re[betaS[tt]/.sol], Im[betaS[tt]/.sol]}, {tt,0,10,0.01}];
-    Quiet@Check[Export[outCsv, Prepend[ts, {"t","ReAlpha","ImAlpha","ReBeta","ImBeta"}], "CSV"]; okCSV=True, Null];
+    Quiet@Check[Export[outCsv, Prepend[ts, {"t","ReAlpha","ImAlpha","ReBeta","ImBeta"}], "CSV"], Null];
   ];
-  If[!MatchQ[p,_Graphics|_Graphics3D] && okCSV===False && Hdef,
+  If[!MatchQ[p,_Graphics|_Graphics3D] && Hdef,
     hVal = With[{hv = globalVal["h"]}, If[NumericQ[hv], N@hv, 1.0]];
     Module[{a,b,Hf}, Quiet@Check[
       Hf[t_] := Evaluate[Symbol["Global`H"][t]];
@@ -243,28 +271,25 @@ wavefunctionFallback[] := Module[
                PlotStyle->{Directive[.90,.20,.20,Thick],Directive[.90,.20,.20,Dashed],Directive[.12,.47,.71,Thick],Directive[.12,.47,.71,Dashed]},
                ImageSize->600, PlotTheme->None, PlotLegends->None];
       ts = Table[{tt, Re[aFun[tt]], Im[aFun[tt]], Re[bFun[tt]], Im[bFun[tt]]}, {tt,0,10,0.01}];
-      Quiet@Check[Export[outCsv, Prepend[ts, {"t","ReAlpha","ImAlpha","ReBeta","ImBeta"}], "CSV"]; okCSV=True, Null];
+      Quiet@Check[Export[outCsv, Prepend[ts, {"t","ReAlpha","ImAlpha","ReBeta","ImBeta"}], "CSV"], Null];
       logLine["FALLBACK(wavefunctionplot): recomputed via Global`H[t]."];
     ];
   ];
-  If[okCSV===False && !MatchQ[p,_Graphics|_Graphics3D],
-    Module[{res=defaultModelSolve[]},
-      If[res=!=$Failed,
-        {aFun,bFun}=res;
-        p = Plot[Evaluate@{Re[aFun[t]],Im[aFun[t]],Re[bFun[t]],Im[bFun[t]]},{t,0,10},
-                 PlotRange->All, Frame->True, FrameLabel->(Style[#,14]&/@{"t (time)","Amplitude"}),
-                 PlotStyle->{Directive[.90,.20,.20,Thick],Directive[.90,.20,.20,Dashed],Directive[.12,.47,.71,Thick],Directive[.12,.47,.71,Dashed]},
-                 ImageSize->600, PlotTheme->None, PlotLegends->None];
-        ts = Table[{tt, Re[aFun[tt]], Im[aFun[tt]], Re[bFun[tt]], Im[bFun[tt]]}, {tt,0,10,0.01}];
-        Quiet@Check[Export[outCsv, Prepend[ts, {"t","ReAlpha","ImAlpha","ReBeta","ImBeta"}], "CSV"]; okCSV=True, Null];
-        logLine["FALLBACK(wavefunctionplot): used internal default model."];
-      ];
+  If[!MatchQ[p,_Graphics|_Graphics3D], Module[{res=defaultModelSolve[]},
+    If[res=!=$Failed, {aFun,bFun}=res;
+      p = Plot[Evaluate@{Re[aFun[t]],Im[aFun[t]],Re[bFun[t]],Im[bFun[t]]},{t,0,10},
+               PlotRange->All, Frame->True, FrameLabel->(Style[#,14]&/@{"t (time)","Amplitude"}),
+               PlotStyle->{Directive[.90,.20,.20,Thick],Directive[.90,.20,.20,Dashed],Directive[.12,.47,.71,Thick],Directive[.12,.47,.71,Dashed]},
+               ImageSize->600, PlotTheme->None, PlotLegends->None];
+      ts = Table[{tt, Re[aFun[tt]], Im[aFun[tt]], Re[bFun[tt]], Im[bFun[tt]]}, {tt,0,10,0.01}];
+      Quiet@Check[Export[outCsv, Prepend[ts, {"t","ReAlpha","ImAlpha","ReBeta","ImBeta"}], "CSV"], Null];
+      logLine["FALLBACK(wavefunctionplot): used internal default model."];
     ];
-  ];
+  ]];
   If[MatchQ[p,_Graphics|_Graphics3D],
     Quiet@Check[Export[outPdf, p, "PDF"], Null];
     Quiet@Check[Export[outPng, p, "PNG", ImageResolution->192, ImageSize->1200], Null];
-    logLine["FALLBACK(wavefunctionplot): wrote ", outPdf, " , ", outPng];
+    logLine["FALLBACK(wavefunctionplot): wrote ", outPdf, "  ,  ", outPng];
     True, False]
 ];
 
@@ -296,7 +321,8 @@ evaluateNotebook[path_String, nbName_String] := Module[
   {nbExpr, total, nInit, nSafe, initCells, restCells, res,
    preFigs, preTabs, postFigs, postTabs, newFigs, newTabs,
    nbBase = StringReplace[FileBaseName[nbName], ".nb" -> ""],
-   gHashes = <||>, collectedGraphics = {}, exportedAll = {}, exportedGraphics = {}, cssOut = None},
+   gHashesLocal = <||>, collectedGraphics = {}, exportedAll = {}, cssOut = None,
+   boxPaths = {}, hadFallback = False},
 
   logLine["IMPORT:", nbName, " @ ", path];
   nbExpr = Quiet @ Check[Import[path, "NB"], $Failed];
@@ -347,7 +373,7 @@ evaluateNotebook[path_String, nbName_String] := Module[
       glist = DeleteDuplicatesBy[glist, hashG];
 
       If[glist =!= {},
-        paths = exportGraphicsList[nbBase, i, glist, gHashes, exportedGraphics];
+        paths = exportGraphicsList[nbBase, i, glist, gHashesLocal];
         If[ListQ[paths] && paths =!= {},
           exportedAll = Join[exportedAll, paths];
           collectedGraphics = Join[collectedGraphics, glist];
@@ -379,14 +405,20 @@ evaluateNotebook[path_String, nbName_String] := Module[
     logLine[If[res === $Aborted || $Failed === res, "EVAL-FAIL:", "EVAL-DONE:"], nbName];
   ];
 
-  (* probability_plot fallback if nothing non-empty got exported *)
+  (* probability_plot fallback *)
   If[StringContainsQ[nbName, "probability_plot", IgnoreCase->True] &&
-     (exportedAll === {} || AllTrue[exportedGraphics, Not@*hasContentQ]),
-    probabilityFallback[];
+     (exportedAll === {} || AllTrue[collectedGraphics, Not@*hasContentQ]),
+    hadFallback = probabilityFallback[];
   ];
 
   (* wavefunction fallback *)
-  If[exportedAll === {} && nbName === "wavefunctionplot.nb", wavefunctionFallback[]];
+  If[exportedAll === {} && nbName === "wavefunctionplot.nb", hadFallback = wavefunctionFallback[]];
+
+  (* BOX-SCRAPE fallback ONLY if nothing exported and no fallback *)
+  If[exportedAll === {} && !TrueQ[hadFallback],
+    boxPaths = exportFromBoxes[nbExpr, nbBase, gHashesLocal];
+    If[ListQ[boxPaths] && boxPaths =!= {}, exportedAll = Join[exportedAll, boxPaths]];
+  ];
 
   If[(collectedGraphics =!= {}) || StringQ @ globalVal["cssRules"] || StringQ @ globalVal["$CSS"],
     cssOut = emitCSS[nbBase, collectedGraphics]; If[StringQ[cssOut], logLine["CSS-WRITE:", nbName, "  ->  ", cssOut]];
