@@ -3,6 +3,8 @@
  - Roots (first match wins):
      1) src/notebooks_run-all WLS
      2) <repo>/notebooks
+     OR:
+     3) "/Applications/Mathematica.app/Contents/MacOS/WolframKernel" -script src/run-all.wls
  - Exports to: src/results/{logs,figs,tables,css}
  - Captures Graphics returned, printed, or assigned to variables
  - Skips berry_phase.nb and *_Exports.nb by default (avoid duplicates)
