@@ -11,4 +11,4 @@ This repository accompanies the manuscript "Geometric-Phase (Pancharatnam--Berry
 `src/` cleaned scripts; `notebooks/` exploratory .nb; `data/` small inputs; `results/` outputs.
 
 ## Citation
-See `CITATION.cff`. A versioned release is archived with a DOI (10.5281/zenodo.17284729)
+See `CITATION.cff`. A versioned release is archived with a DOI (10.5281/zenodo.17462357)

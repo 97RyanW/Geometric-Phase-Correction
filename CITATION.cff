@@ -10,11 +10,11 @@ authors:
     # orcid: https://orcid.org/0000-0000-0000-0000
 version: 1.0.0
 commit: 2d3ed42
-doi: 10.5281/zenodo.17284729
+doi: 10.5281/zenodo.17462357
 date-released: 2025-08-01
 license: MIT
 repository-code: https://github.com/97RyanW/Geometric-Phase-Correction
-repository-artifact: https://doi.org/10.5281/zenodo.17284729
+repository-artifact: https://doi.org/10.5281/zenodo.17462357
 keywords:
   - time-bin photonics
   - geometric phase
@@ -35,7 +35,7 @@ preferred-citation:
     - family-names: Söhl-Brußese
       given-names: Nicholas
   version: 1.0.0
-  doi: 10.5281/zenodo.17284729
+  doi: 10.5281/zenodo.17462357
   date-released: 2025
 references:
   - type: article
